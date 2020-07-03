@@ -49,7 +49,9 @@ import org.apache.druid.math.expr.Parser;
 import org.apache.druid.query.DataSource;
 import org.apache.druid.query.Query;
 import org.apache.druid.query.QueryDataSource;
+import org.apache.druid.query.aggregation.AggregatorFactory;
 import org.apache.druid.query.aggregation.PostAggregator;
+import org.apache.druid.query.aggregation.first.LongFirstAggregatorFactory;
 import org.apache.druid.query.dimension.DimensionSpec;
 import org.apache.druid.query.expression.TimestampFloorExprMacro;
 import org.apache.druid.query.filter.DimFilter;
@@ -119,6 +121,8 @@ public class DruidQuery
   private final RowSignature outputRowSignature;
   private final RelDataType outputRowType;
   private final VirtualColumnRegistry virtualColumnRegistry;
+
+  private static VirtualColumn granularityVirutalColumn;
 
   public DruidQuery(
       final PartialDruidQuery partialQuery,
@@ -394,6 +398,7 @@ public class DruidQuery
                   newDruidExpression,
                   SqlTypeName.VARCHAR
           );
+          granularityVirutalColumn = virtualColumn;
         } else {
           virtualColumn = virtualColumnRegistry.getOrCreateVirtualColumnForExpression(
                   plannerContext,
@@ -733,6 +738,14 @@ public class DruidQuery
     final Map<String, Object> theContext = new HashMap<>();
     theContext.put("skipEmptyBuckets", true);
     theContext.putAll(plannerContext.getQueryContext());
+    List<AggregatorFactory> aggregatorSpecs = grouping.getAggregatorFactories();
+    if (granularityVirutalColumn != null) {
+      aggregatorSpecs = new ArrayList<>(grouping.getAggregatorFactories());
+      aggregatorSpecs.add(new LongFirstAggregatorFactory(
+              granularityVirutalColumn.getOutputName(),
+              granularityVirutalColumn.getOutputName())
+      );
+    }
 
     return new TimeseriesQuery(
         dataSource,
@@ -741,7 +754,7 @@ public class DruidQuery
         getVirtualColumns(true),
         filtration.getDimFilter(),
         queryGranularity,
-        grouping.getAggregatorFactories(),
+        aggregatorSpecs,
         postAggregators,
         timeseriesLimit,
         ImmutableSortedMap.copyOf(theContext)
@@ -981,7 +994,7 @@ public class DruidQuery
     } else if (Period.parse("P1M").equals(period)) {
       dateFormat = "yyyyMM";
     } else if (Period.parse("P1D").equals(period)) {
-      dateFormat = "yyyyMMDD";
+      dateFormat = "yyyyMMdd";
     } else {
       throw new ISE("Flooring timestamp at period " +
               period + " is not supported.");
