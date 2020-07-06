@@ -59,7 +59,7 @@ public class Grouping
       final RowSignature outputRowSignature
   )
   {
-    this.dimensions = ImmutableList.copyOf(dimensions);
+    this.dimensions = dimensions;
     this.aggregations = ImmutableList.copyOf(aggregations);
     this.havingFilter = havingFilter;
     this.outputRowSignature = outputRowSignature;

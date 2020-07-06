@@ -44,12 +44,16 @@ import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.druid.java.util.common.ISE;
 import org.apache.druid.java.util.common.granularity.Granularities;
 import org.apache.druid.java.util.common.granularity.Granularity;
+import org.apache.druid.math.expr.ExprMacroTable;
 import org.apache.druid.math.expr.Parser;
 import org.apache.druid.query.DataSource;
 import org.apache.druid.query.Query;
 import org.apache.druid.query.QueryDataSource;
+import org.apache.druid.query.aggregation.AggregatorFactory;
 import org.apache.druid.query.aggregation.PostAggregator;
+import org.apache.druid.query.aggregation.first.LongFirstAggregatorFactory;
 import org.apache.druid.query.dimension.DimensionSpec;
+import org.apache.druid.query.expression.TimestampFloorExprMacro;
 import org.apache.druid.query.filter.DimFilter;
 import org.apache.druid.query.groupby.GroupByQuery;
 import org.apache.druid.query.groupby.having.DimFilterHavingSpec;
@@ -78,6 +82,7 @@ import org.apache.druid.sql.calcite.planner.Calcites;
 import org.apache.druid.sql.calcite.planner.PlannerContext;
 import org.apache.druid.sql.calcite.rule.GroupByRules;
 import org.apache.druid.sql.calcite.table.RowSignature;
+import org.joda.time.Period;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -116,6 +121,8 @@ public class DruidQuery
   private final RowSignature outputRowSignature;
   private final RelDataType outputRowType;
   private final VirtualColumnRegistry virtualColumnRegistry;
+
+  private static VirtualColumn granularityVirutalColumn;
 
   public DruidQuery(
       final PartialDruidQuery partialQuery,
@@ -383,11 +390,22 @@ public class DruidQuery
 
       final String dimOutputName;
       if (!druidExpression.isSimpleExtraction()) {
-        virtualColumn = virtualColumnRegistry.getOrCreateVirtualColumnForExpression(
-            plannerContext,
-            druidExpression,
-            sqlTypeName
-        );
+        if (isExpressionForSettingGranularity(druidExpression, plannerContext.getExprMacroTable())) {
+          DruidExpression newDruidExpression =
+                  convertTimestampFloorToTimestampFormat(druidExpression, plannerContext);
+          virtualColumn = virtualColumnRegistry.getOrCreateVirtualColumnForExpression(
+                  plannerContext,
+                  newDruidExpression,
+                  SqlTypeName.VARCHAR
+          );
+          granularityVirutalColumn = virtualColumn;
+        } else {
+          virtualColumn = virtualColumnRegistry.getOrCreateVirtualColumnForExpression(
+                  plannerContext,
+                  druidExpression,
+                  sqlTypeName
+          );
+        }
         dimOutputName = virtualColumn.getOutputName();
       } else {
         dimOutputName = outputNamePrefix + outputNameCounter++;
@@ -720,15 +738,23 @@ public class DruidQuery
     final Map<String, Object> theContext = new HashMap<>();
     theContext.put("skipEmptyBuckets", true);
     theContext.putAll(plannerContext.getQueryContext());
+    List<AggregatorFactory> aggregatorSpecs = grouping.getAggregatorFactories();
+    if (granularityVirutalColumn != null) {
+      aggregatorSpecs = new ArrayList<>(grouping.getAggregatorFactories());
+      aggregatorSpecs.add(new LongFirstAggregatorFactory(
+              granularityVirutalColumn.getOutputName(),
+              granularityVirutalColumn.getOutputName())
+      );
+    }
 
     return new TimeseriesQuery(
         dataSource,
         filtration.getQuerySegmentSpec(),
         descending,
-        getVirtualColumns(false),
+        getVirtualColumns(true),
         filtration.getDimFilter(),
         queryGranularity,
-        grouping.getAggregatorFactories(),
+        aggregatorSpecs,
         postAggregators,
         timeseriesLimit,
         ImmutableSortedMap.copyOf(theContext)
@@ -818,11 +844,28 @@ public class DruidQuery
   @Nullable
   public GroupByQuery toGroupByQuery()
   {
+    Granularity queryGranularity = null;
     if (grouping == null) {
       return null;
     }
 
     final Filtration filtration = Filtration.create(filter).optimize(virtualColumnRegistry.getFullRowSignature());
+    for (DimensionExpression de : grouping.getDimensions()) {
+      Granularity granularity = Expressions.toQueryGranularity(
+              de.getDruidExpression(), plannerContext.getExprMacroTable());
+      if (granularity != null) {
+        if (queryGranularity == null) {
+          queryGranularity = granularity;
+        } else {
+          if (!granularity.equals(queryGranularity)) {
+            throw new ISE("query granularity conflict in grouping dimentions.");
+          }
+        }
+      }
+    }
+    if (queryGranularity == null) {
+      queryGranularity = Granularities.ALL;
+    }
 
     final DimFilterHavingSpec havingSpec;
     if (grouping.getHavingFilter() != null) {
@@ -845,7 +888,7 @@ public class DruidQuery
         filtration.getQuerySegmentSpec(),
         getVirtualColumns(true),
         filtration.getDimFilter(),
-        Granularities.ALL,
+        queryGranularity,
         grouping.getDimensionSpecs(),
         grouping.getAggregatorFactories(),
         postAggregators,
@@ -923,5 +966,54 @@ public class DruidQuery
         false,
         ImmutableSortedMap.copyOf(plannerContext.getQueryContext())
     );
+  }
+
+  /**
+   * convert the {@code floorExpression} which is timestamp_floor function
+   * to a timestamp_format expression.
+   * @param floorExpression the floor expression to convert.
+   * @param plannerContext planner context.
+   */
+  private static DruidExpression convertTimestampFloorToTimestampFormat(
+          DruidExpression floorExpression,
+          PlannerContext plannerContext
+  )
+  {
+    TimestampFloorExprMacro.TimestampFloorExpr tsFloorExpr = Expressions.asTimestampFloorExpr(
+            floorExpression,
+            plannerContext.getExprMacroTable()
+    );
+    assert tsFloorExpr != null;
+
+    String tsExpr = tsFloorExpr.getArg().getIdentifierIfIdentifier();
+
+    String dateFormat;
+    Period period = tsFloorExpr.getGranularity().getPeriod();
+    if (Period.parse("P1Y").equals(period)) {
+      dateFormat = "yyyy";
+    } else if (Period.parse("P1M").equals(period)) {
+      dateFormat = "yyyyMM";
+    } else if (Period.parse("P1D").equals(period)) {
+      dateFormat = "yyyyMMdd";
+    } else {
+      throw new ISE("Flooring timestamp at period " +
+              period + " is not supported.");
+    }
+    String timezone = "UTC";
+    String dimensionExprStr = "timestamp_format(" + tsExpr +
+            "," + "'" + dateFormat + "','" + timezone + "')";
+    return DruidExpression.fromExpression(dimensionExprStr);
+  }
+
+  private static boolean isExpressionForSettingGranularity(
+      DruidExpression druidExpression,
+      ExprMacroTable macroTable)
+  {
+    TimestampFloorExprMacro.TimestampFloorExpr floorExpr =
+            Expressions.asTimestampFloorExpr(druidExpression, macroTable);
+    if (floorExpr == null) {
+      return false;
+    }
+    return ColumnHolder.TIME_COLUMN_NAME.equals(floorExpr.getArg().getIdentifierIfIdentifier());
   }
 }
