@@ -21,19 +21,34 @@ package org.apache.druid.sql.calcite.rule;
 
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableList;
+import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptRuleOperand;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.externalize.RelWriterImpl;
+import org.apache.calcite.rel.logical.LogicalProject;
+import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rex.RexInputRef;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.druid.java.util.common.StringUtils;
+import org.apache.druid.sql.calcite.rel.DruidConvention;
 import org.apache.druid.sql.calcite.rel.DruidOuterQueryRel;
+import org.apache.druid.sql.calcite.rel.DruidQuery;
 import org.apache.druid.sql.calcite.rel.DruidRel;
 import org.apache.druid.sql.calcite.rel.PartialDruidQuery;
+import org.apache.druid.sql.calcite.table.RowSignature;
 
+import javax.annotation.Nullable;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BiFunction;
 
@@ -133,6 +148,31 @@ public class DruidRules
         call.transformTo(newDruidRel);
       }
     }
+  }
+
+  @Nullable
+  private static Project createNewProjectForDruidRel(Project proj, DruidRel druidRel)
+  {
+    RelOptCluster cluster = proj.getCluster();
+    List<RexNode> projects = new ArrayList<>();
+    DruidQuery druidQuery = druidRel.toDruidQuery(false);
+
+    if (druidQuery != null) {
+      RowSignature signature = druidQuery.getOutputRowSignature();
+      List<RelDataTypeField> fieldList = druidQuery.getOutputRowType().getFieldList();
+      for (int i = 0; i < signature.getRowOrder().size(); i++) {
+        RexNode ref = new RexInputRef(i, fieldList.get(i).getType());
+        projects.add(ref);
+      }
+      return new LogicalProject(
+              cluster,
+              proj.getTraitSet().replace(DruidConvention.instance()),
+              druidRel,
+              projects,
+              proj.getRowType()
+      );
+    }
+    return null;
   }
 
   public abstract static class DruidOuterQueryRule extends RelOptRule
@@ -277,5 +317,20 @@ public class DruidRules
       final DruidRel druidRel = call.rel(call.getRelList().size() - 1);
       return druidRel.getPartialDruidQuery().stage().compareTo(PartialDruidQuery.Stage.AGGREGATE) >= 0;
     }
+  }
+
+  public static String explainRelNode(
+          final RelNode rel,
+          SqlExplainLevel detailLevel)
+  {
+    if (rel == null) {
+      return null;
+    }
+    final StringWriter sw = new StringWriter();
+    final RelWriter planWriter =
+            new RelWriterImpl(
+                    new PrintWriter(sw), detailLevel, false);
+    rel.explain(planWriter);
+    return sw.toString();
   }
 }
